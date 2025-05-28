@@ -1,0 +1,220 @@
+#include <ESP8266WiFi.h>
+#include <Servo.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+
+// WiFi Credentials
+#define WLAN_SSID       "wifi SSID"
+#define WLAN_PASS       "Password"
+
+// Adafruit IO Credentials
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883
+#define AIO_USERNAME    "adafruit io username"
+#define AIO_KEY         "key"
+
+// Pin Definitions
+#define LED_PIN     D4
+#define SERVO_PIN   D5
+#define BOWL_TRIG   D6
+#define BOWL_ECHO   D7
+#define STOCK_TRIG  D1
+#define STOCK_ECHO  D2
+
+// Threshold Values
+#define BOWL_FULL_DISTANCE 15
+#define BOWL_EMPTY_DISTANCE 16.3
+#define STOCK_FULL_DISTANCE 5
+#define STOCK_EMPTY_DISTANCE 11
+
+// Servo Angles
+#define SERVO_CLOSED_ANGLE 0
+#define SERVO_OPEN_ANGLE 180
+
+// MQTT Objects
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+// Subscribe feeds
+Adafruit_MQTT_Subscribe ledControl = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/led");
+Adafruit_MQTT_Subscribe servoControl = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/servo");
+
+// Publish feeds
+Adafruit_MQTT_Publish bowlStatusFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/bowl-status");
+Adafruit_MQTT_Publish stockStatusFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/stock-status");
+Adafruit_MQTT_Publish servoStatusFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/servo");
+
+Servo myServo;
+bool servoState = false;  // false = closed, true = open
+
+unsigned long lastBowlUpdate = 0;
+unsigned long lastStockUpdate = 0;
+const unsigned long bowlInterval = 10000;
+const unsigned long stockInterval = 30000;
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  // Pin setup
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  pinMode(BOWL_TRIG, OUTPUT);
+  pinMode(BOWL_ECHO, INPUT);
+  pinMode(STOCK_TRIG, OUTPUT);
+  pinMode(STOCK_ECHO, INPUT);
+
+  myServo.attach(SERVO_PIN);
+  myServo.write(SERVO_CLOSED_ANGLE);
+
+  // WiFi connect
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  mqtt.subscribe(&ledControl);
+  mqtt.subscribe(&servoControl);
+
+  // Blink test
+  digitalWrite(LED_PIN, LOW);
+  delay(200);
+  digitalWrite(LED_PIN, HIGH);
+  Serial.println("Setup complete");
+}
+
+String lastServoCommand = "";  
+
+void loop() {
+  MQTT_connect();
+
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(100))) {
+    if (subscription == &ledControl) {
+      String value = (char *)ledControl.lastread;
+      value.trim();
+      value.toUpperCase();
+
+      if (value == "ON" || value == "1" || value == "TRUE") {
+        digitalWrite(LED_PIN, LOW);
+        Serial.println("LED turned ON");
+      } else if (value == "OFF" || value == "0" || value == "FALSE") {
+        digitalWrite(LED_PIN, HIGH);
+        Serial.println("LED turned OFF");
+      }
+    }
+
+    if (subscription == &servoControl) {
+      String value = (char *)servoControl.lastread;
+      value.trim();
+      value.toUpperCase();
+
+      // Ignore duplicate commands
+      if (value == lastServoCommand) {
+        continue;
+      }
+
+      lastServoCommand = value;
+
+      float bowlDistance = getDistanceCM(BOWL_TRIG, BOWL_ECHO);
+      Serial.print("Received Servo command: ");
+      Serial.println(value);
+
+      if (value == "OPEN") {
+        if (bowlDistance <= BOWL_FULL_DISTANCE) {
+          Serial.println(" Cannot open: Bowl is full");
+          bowlStatusFeed.publish("Bowl is full");
+        } else {
+          myServo.write(SERVO_OPEN_ANGLE);
+          servoState = true;
+          servoStatusFeed.publish("OPEN");
+          Serial.println(" Servo opened to 150°");
+        }
+      } else if (value == "CLOSE") {
+        myServo.write(SERVO_CLOSED_ANGLE);
+        servoState = false;
+        servoStatusFeed.publish("CLOSE");
+        Serial.println(" Servo closed to 0°");
+      } else {
+        int angle = value.toInt();
+        if (angle >= 0 && angle <= 180) {
+          myServo.write(angle);
+          servoState = (angle > 0);
+          servoStatusFeed.publish(String(angle).c_str());
+          Serial.println("✅ Servo set to: " + String(angle) + "°");
+        }
+      }
+    }
+  }
+
+  // No changes needed below this point
+  unsigned long now = millis();
+
+  if (now - lastBowlUpdate >= bowlInterval) {
+    lastBowlUpdate = now;
+    float bowlDistance = getDistanceCM(BOWL_TRIG, BOWL_ECHO);
+
+    if (bowlDistance <= BOWL_FULL_DISTANCE) {
+      bowlStatusFeed.publish("Bowl is full");
+      Serial.println("Bowl Status: Full (" + String(bowlDistance) + "cm)");
+
+      if (servoState) {
+        myServo.write(SERVO_CLOSED_ANGLE);
+        servoState = false;
+        servoStatusFeed.publish("CLOSE");
+        Serial.println(" Auto-close: Bowl is full");
+      }
+    } else if (bowlDistance > BOWL_EMPTY_DISTANCE) {
+      bowlStatusFeed.publish("Bowl is empty");
+      Serial.println("Bowl Status: Empty (" + String(bowlDistance) + "cm)");
+    } else {
+      bowlStatusFeed.publish("Bowl has food");
+      Serial.println("Bowl Status: Has food (" + String(bowlDistance) + "cm)");
+    }
+  }
+
+  if (now - lastStockUpdate >= stockInterval) {
+    lastStockUpdate = now;
+    float stockDistance = getDistanceCM(STOCK_TRIG, STOCK_ECHO);
+
+    if (stockDistance < STOCK_FULL_DISTANCE) {
+      stockStatusFeed.publish("Stock is full");
+      Serial.println("Stock Status: Full (" + String(stockDistance) + "cm)");
+    } else if (stockDistance > STOCK_EMPTY_DISTANCE) {
+      stockStatusFeed.publish("Stock is empty");
+      Serial.println("Stock Status: Empty (" + String(stockDistance) + "cm)");
+    } else {
+      stockStatusFeed.publish("Stock is low");
+      Serial.println("Stock Status: Low (" + String(stockDistance) + "cm)");
+    }
+  }
+}
+
+
+float getDistanceCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  return duration * 0.034 / 2.0;
+}
+
+void MQTT_connect() {
+  int8_t ret;
+  if (mqtt.connected()) return;
+
+  Serial.print("Connecting to MQTT...");
+  while ((ret = mqtt.connect()) != 0) {
+    Serial.println(mqtt.connectErrorString(ret));
+    mqtt.disconnect();
+    delay(5000);
+  }
+  Serial.println("MQTT Connected!");
+}
