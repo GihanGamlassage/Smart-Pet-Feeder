@@ -1,0 +1,198 @@
+import tkinter as tk
+from tkinter import messagebox
+from Adafruit_IO import Client, Feed, RequestError
+
+# -------- Adafruit IO Credentials --------
+ADAFRUIT_IO_USERNAME = "Username"
+ADAFRUIT_IO_KEY = "key"
+
+# -------- Feed Names --------
+LED_FEED = "led"
+SERVO_FEED = "servo"
+BOWL_STATUS_FEED = "bowl-status"
+STOCK_STATUS_FEED = "stock-status"
+
+# -------- Setup Adafruit IO Client --------
+aio = Client(ADAFRUIT_IO_USERNAME, ADAFRUIT_IO_KEY)
+
+def ensure_feed(feed_name):
+    try:
+        return aio.feeds(feed_name)
+    except RequestError:
+        return aio.create_feed(Feed(name=feed_name))
+
+# Initialize feeds
+led_feed = ensure_feed(LED_FEED)
+servo_feed = ensure_feed(SERVO_FEED)
+bowl_status_feed = ensure_feed(BOWL_STATUS_FEED)
+stock_status_feed = ensure_feed(STOCK_STATUS_FEED)
+
+# GUI state
+led_on = False
+servo_open = False
+
+# ---------------------- GUI Setup ----------------------
+root = tk.Tk()
+root.title(" Smart Pet Feeder Dashboard")
+root.geometry("400x600")
+root.configure(bg="#e9f7fb")
+
+default_font = ("Segoe UI", 11)
+
+# Header
+header = tk.Label(root, text=" SMART PET FEEDER ", font=("Segoe UI", 18, "bold"), bg="#e9f7fb", fg="#34495e")
+header.pack(pady=15)
+
+# Frame styles
+frame_style = {
+    "font": ("Segoe UI", 12, "bold"),
+    "bg": "#ffffff",
+    "bd": 1,
+    "relief": "ridge",
+    "padx": 10,
+    "pady": 10
+}
+
+# Button hover behavior
+def on_enter(e): e.widget.config(bg="#2980b9")
+def on_leave(e): e.widget.config(bg=e.widget.original_bg)
+
+def styled_button(parent, text, command, color):
+    btn = tk.Button(parent, text=text, command=command,
+                    bg=color, fg="white", font=default_font,
+                    relief="flat", padx=10, pady=5)
+    btn.original_bg = color
+    btn.bind("<Enter>", on_enter)
+    btn.bind("<Leave>", on_leave)
+    return btn
+
+# ---------------- LED Control Frame ----------------
+led_frame = tk.LabelFrame(root, text="--LED Control--", **frame_style)
+led_frame.pack(pady=10, padx=20, fill="x")
+
+led_button = styled_button(led_frame, "Turn ON", lambda: toggle_led(), "#27ae60")
+led_button.pack(pady=8)
+
+led_status_label = tk.Label(led_frame, text="LED Status: OFF", font=default_font, bg="#ffffff", fg="red")
+led_status_label.pack()
+
+# ---------------- Servo Control Frame ----------------
+servo_frame = tk.LabelFrame(root, text="--Feed Gate Control--", **frame_style)
+servo_frame.pack(pady=10, padx=20, fill="x")
+
+servo_button = styled_button(servo_frame, "Open Gate", lambda: toggle_servo(), "#2980b9")
+servo_button.pack(pady=8)
+
+servo_status_label = tk.Label(servo_frame, text="Servo Gate: CLOSED (0°)", font=default_font, bg="#ffffff", fg="purple")
+servo_status_label.pack()
+
+# ---------------- Bowl Status Frame ----------------
+bowl_frame = tk.LabelFrame(root, text="--Food Bowl Status--", **frame_style)
+bowl_frame.pack(pady=10, padx=20, fill="x")
+
+food_level_label = tk.Label(bowl_frame, text="Checking...", font=("Segoe UI", 11, "bold"), bg="#ffffff", fg="gray")
+food_level_label.pack()
+
+# ---------------- Stock Status Frame ----------------
+stock_frame = tk.LabelFrame(root, text="--Food Stock Status--", **frame_style)
+stock_frame.pack(pady=10, padx=20, fill="x")
+
+food_stock_label = tk.Label(stock_frame, text="Checking...", font=("Segoe UI", 11, "bold"), bg="#ffffff", fg="gray")
+food_stock_label.pack()
+
+# ---------------- Functions ----------------
+
+def toggle_led():
+    global led_on
+    led_on = not led_on
+    if led_on:
+        aio.send(LED_FEED, "ON")
+        led_status_label.config(text="LED Status: ON", fg="green")
+        led_button.config(text="Turn OFF", bg="red")
+        led_button.original_bg = "red"
+    else:
+        aio.send(LED_FEED, "OFF")
+        led_status_label.config(text="LED Status: OFF", fg="red")
+        led_button.config(text="Turn ON", bg="#27ae60")
+        led_button.original_bg = "#27ae60"
+
+def toggle_servo():
+    global servo_open
+    try:
+        bowl_data = aio.receive(BOWL_STATUS_FEED)
+        bowl_status = bowl_data.value.strip().lower()
+
+        if not servo_open:
+            if bowl_status == "bowl is full":
+                tk.messagebox.showwarning("⚠️ Warning", "Cannot open the gate. Bowl is already full.")
+                return
+            else:
+                servo_open = True
+                aio.send(SERVO_FEED, "OPEN")
+                servo_status_label.config(text="Servo Gate: OPEN (150°)", fg="blue")
+                servo_button.config(text="Close Gate", bg="orange")
+                servo_button.original_bg = "orange"
+        else:
+            servo_open = False
+            aio.send(SERVO_FEED, "CLOSE")
+            servo_status_label.config(text="Servo Gate: CLOSED (0°)", fg="purple")
+            servo_button.config(text="Open Gate", bg="#2980b9")
+            servo_button.original_bg = "#2980b9"
+
+    except Exception as e:
+        print("Error toggling servo:", e)
+        tk.messagebox.showerror("Error", "Failed to control servo.")
+
+def update_levels():
+    global servo_open
+    try:
+        servo_data = aio.receive(SERVO_FEED)
+        bowl_data = aio.receive(BOWL_STATUS_FEED)
+        stock_data = aio.receive(STOCK_STATUS_FEED)
+
+        current_servo_value = servo_data.value.strip().upper()
+        bowl_status = bowl_data.value.strip().lower()
+        stock_status = stock_data.value.strip().lower()
+
+        if "bowl is full" in bowl_status:
+            food_level_label.config(text="Food Bowl: FULL", fg="green")
+            if servo_open and current_servo_value != "CLOSE":
+                servo_open = False
+                aio.send(SERVO_FEED, "CLOSE")
+                servo_status_label.config(text="Servo Gate: CLOSED (0°)", fg="purple")
+                servo_button.config(text="Open Gate", bg="#2980b9")
+                servo_button.original_bg = "#2980b9"
+        elif "bowl is empty" in bowl_status:
+            food_level_label.config(text="Food Bowl: EMPTY", fg="red")
+        else:
+            food_level_label.config(text=f"Food Bowl: {bowl_status}", fg="orange")
+
+        if "stock is full" in stock_status:
+            food_stock_label.config(text="Food Stock: FULL", fg="green")
+        elif "stock is empty" in stock_status:
+            food_stock_label.config(text="Food Stock: EMPTY", fg="red")
+        else:
+            food_stock_label.config(text=f"Food Stock: {stock_status}", fg="orange")
+
+        if current_servo_value == "CLOSE":
+            if servo_open:
+                servo_open = False
+                servo_status_label.config(text="Servo Gate: CLOSED (0°)", fg="purple")
+                servo_button.config(text="Open Gate", bg="#2980b9")
+                servo_button.original_bg = "#2980b9"
+        elif current_servo_value == "OPEN":
+            if not servo_open:
+                servo_open = True
+                servo_status_label.config(text="Servo Gate: OPEN (150°)", fg="blue")
+                servo_button.config(text="Close Gate", bg="orange")
+                servo_button.original_bg = "orange"
+
+    except Exception as e:
+        print("Error updating levels:", e)
+        food_level_label.config(text="Food Bowl: Error", fg="gray")
+        food_stock_label.config(text="Food Stock: Error", fg="gray")
+
+    root.after(5000, update_levels)
+
+update_levels()
+root.mainloop()
